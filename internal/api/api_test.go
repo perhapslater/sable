@@ -1,0 +1,893 @@
+package api_test
+
+import (
+	"bytes"
+	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/perhapslater/sable/internal/api"
+	"github.com/perhapslater/sable/internal/protocol"
+	"github.com/perhapslater/sable/internal/session"
+)
+
+const testJWTSecret = "test-only-signing-value"
+
+func setupAPI(t *testing.T) (*api.Router, *session.Store) {
+	t.Helper()
+	store := session.NewStore()
+	store.Register(&session.Agent{
+		ID:       "agent-1",
+		Secret:   []byte("secret"),
+		Hostname: "victim",
+		OS:       "linux",
+		Arch:     "amd64",
+		LastSeen: time.Now(),
+	})
+	cfg := &api.Config{
+		OperatorPasswordHash: api.HashPassword("testpassword"),
+		JWTSecret:            []byte(testJWTSecret),
+	}
+	return api.NewRouter(store, cfg), store
+}
+
+func TestAgentLifecycleAndArtifactControls(t *testing.T) {
+	router, store := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	headers := map[string]string{"Authorization": "Bearer " + token, "Content-Type": "application/json"}
+
+	rekey := doRequest(t, router, http.MethodPost, "/api/agents/agent-1/rekey", nil, headers)
+	if rekey.Code != http.StatusOK {
+		t.Fatalf("rekey status = %d: %s", rekey.Code, rekey.Body.String())
+	}
+	var rotated map[string]string
+	if err := json.NewDecoder(rekey.Body).Decode(&rotated); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := hex.DecodeString(rotated["secret_hex"])
+	if err != nil || len(decoded) != 32 {
+		t.Fatalf("invalid rotated secret: %q", rotated["secret_hex"])
+	}
+	stored, ok := store.Secret("agent-1")
+	if !ok || !bytes.Equal(stored, decoded) {
+		t.Fatal("rotated secret was not stored")
+	}
+
+	if _, ok := store.AddArtifact("agent-1", session.Artifact{ID: "artifact-1", Filename: "proof.txt", Data: "aGVsbG8="}); !ok {
+		t.Fatal("failed to seed artifact")
+	}
+	retention := doRequest(t, router, http.MethodPut, "/api/agents/agent-1/artifacts/retention", []byte(`{"max_items":1}`), headers)
+	if retention.Code != http.StatusNoContent {
+		t.Fatalf("retention status = %d: %s", retention.Code, retention.Body.String())
+	}
+	deletedArtifact := doRequest(t, router, http.MethodDelete, "/api/agents/agent-1/artifacts/artifact-1", nil, headers)
+	if deletedArtifact.Code != http.StatusNoContent {
+		t.Fatalf("delete artifact status = %d", deletedArtifact.Code)
+	}
+
+	deletedAgent := doRequest(t, router, http.MethodDelete, "/api/agents/agent-1", nil, headers)
+	if deletedAgent.Code != http.StatusNoContent {
+		t.Fatalf("delete agent status = %d", deletedAgent.Code)
+	}
+	if _, ok := store.Get("agent-1"); ok {
+		t.Fatal("revoked agent still exists")
+	}
+}
+
+func TestCollectionPaginationHeadersAndSlices(t *testing.T) {
+	router, store := setupAPI(t)
+	store.Register(&session.Agent{ID: "agent-2", Secret: []byte("secret")})
+	store.Register(&session.Agent{ID: "agent-3", Secret: []byte("secret")})
+	token := loginAndGetToken(t, router)
+	w := doRequest(t, router, http.MethodGet, "/api/agents?limit=1&offset=1", nil, map[string]string{
+		"Authorization": "Bearer " + token,
+	})
+	if w.Code != http.StatusOK || w.Header().Get("X-Total-Count") != "3" || w.Header().Get("X-Limit") != "1" || w.Header().Get("X-Offset") != "1" {
+		t.Fatalf("unexpected pagination response: status=%d headers=%v", w.Code, w.Header())
+	}
+	var agents []session.Agent
+	if err := json.NewDecoder(w.Body).Decode(&agents); err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].ID != "agent-2" {
+		t.Fatalf("unexpected page: %+v", agents)
+	}
+}
+
+// doRequest performs an in-process HTTP request against the router using httptest.NewRecorder.
+func doRequest(t *testing.T, router http.Handler, method, path string, body []byte, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	var reqBody *bytes.Reader
+	if body != nil {
+		reqBody = bytes.NewReader(body)
+	} else {
+		reqBody = bytes.NewReader(nil)
+	}
+	req := httptest.NewRequest(method, path, reqBody)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w
+}
+
+// loginAndGetToken performs a login request in-process and returns the JWT token.
+func loginAndGetToken(t *testing.T, router http.Handler) string {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"password": "testpassword"})
+	w := doRequest(t, router, http.MethodPost, "/api/auth/login", body, map[string]string{
+		"Content-Type": "application/json",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("login failed: %d", w.Code)
+	}
+	var result map[string]string
+	json.NewDecoder(w.Body).Decode(&result) //nolint:errcheck
+	token := result["token"]
+	if token == "" {
+		t.Fatal("expected non-empty token")
+	}
+	return token
+}
+
+func signToken(t *testing.T, claims jwt.Claims) string {
+	t.Helper()
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := token.SignedString([]byte(testJWTSecret))
+	if err != nil {
+		t.Fatalf("SignedString failed: %v", err)
+	}
+	return signed
+}
+
+func TestLoginSuccess(t *testing.T) {
+	router, _ := setupAPI(t)
+	loginAndGetToken(t, router) // fails if token empty
+}
+
+func TestShutdownRequiresAuthenticationAndInvokesCallback(t *testing.T) {
+	store := session.NewStore()
+	shutdown := make(chan struct{}, 1)
+	router := api.NewRouter(store, &api.Config{
+		OperatorPasswordHash: api.HashPassword("testpassword"),
+		JWTSecret:            []byte(testJWTSecret),
+		Shutdown: func() {
+			shutdown <- struct{}{}
+		},
+	})
+
+	unauthorized := doRequest(t, router, http.MethodPost, "/api/admin/shutdown", nil, nil)
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized shutdown status = %d", unauthorized.Code)
+	}
+	token := loginAndGetToken(t, router)
+	headers := map[string]string{"Authorization": "Bearer " + token}
+	wrongMethod := doRequest(t, router, http.MethodGet, "/api/admin/shutdown", nil, headers)
+	if wrongMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET shutdown status = %d", wrongMethod.Code)
+	}
+	accepted := doRequest(t, router, http.MethodPost, "/api/admin/shutdown", nil, headers)
+	if accepted.Code != http.StatusAccepted {
+		t.Fatalf("shutdown status = %d: %s", accepted.Code, accepted.Body.String())
+	}
+	select {
+	case <-shutdown:
+	default:
+		t.Fatal("shutdown callback was not invoked")
+	}
+}
+
+func TestLoginWrongPassword(t *testing.T) {
+	router, _ := setupAPI(t)
+	body, _ := json.Marshal(map[string]string{"password": "wrongpassword"})
+	w := doRequest(t, router, http.MethodPost, "/api/auth/login", body, map[string]string{
+		"Content-Type": "application/json",
+	})
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestLoginRejectsNonJSONContentType(t *testing.T) {
+	router, _ := setupAPI(t)
+	body := []byte(`{"password":"testpassword"}`)
+	w := doRequest(t, router, http.MethodPost, "/api/auth/login", body, map[string]string{
+		"Content-Type": "text/plain",
+	})
+	if w.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("expected 415, got %d", w.Code)
+	}
+}
+
+func TestLoginRejectsTrailingJSON(t *testing.T) {
+	router, _ := setupAPI(t)
+	body := []byte(`{"password":"testpassword"}{"extra":true}`)
+	w := doRequest(t, router, http.MethodPost, "/api/auth/login", body, map[string]string{
+		"Content-Type": "application/json",
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestListAgentsRequiresAuth(t *testing.T) {
+	router, _ := setupAPI(t)
+	w := doRequest(t, router, http.MethodGet, "/api/agents", nil, nil)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without token, got %d", w.Code)
+	}
+}
+
+func TestListAgentsWithAuth(t *testing.T) {
+	router, _ := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	w := doRequest(t, router, http.MethodGet, "/api/agents", nil, map[string]string{
+		"Authorization": "Bearer " + token,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+}
+
+func TestOverviewReturnsFleetSummaries(t *testing.T) {
+	router, _ := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	w := doRequest(t, router, http.MethodGet, "/api/overview", nil, map[string]string{
+		"Authorization": "Bearer " + token,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("overview status = %d: %s", w.Code, w.Body.String())
+	}
+	var overview session.FleetOverview
+	if err := json.NewDecoder(w.Body).Decode(&overview); err != nil {
+		t.Fatal(err)
+	}
+	if overview.Total != 1 || len(overview.Agents) != 1 || overview.Agents[0].ID != "agent-1" {
+		t.Fatalf("unexpected overview: %#v", overview)
+	}
+	if len(overview.TaskOutcomes24Hours) != 24 || len(overview.TaskOutcomes7Days) != 7 {
+		t.Fatalf("overview omitted task outcome buckets: %#v", overview)
+	}
+}
+
+func TestResolveOverviewFailureAlertRetainsOutputAndHistory(t *testing.T) {
+	router, store := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	headers := map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	}
+	if err := store.EnqueueTask("agent-1", &protocol.Task{ID: "failed-task", Type: "screenshot"}); err != nil {
+		t.Fatal(err)
+	}
+	if delivered := store.DeliverTask("agent-1"); delivered == nil || delivered.ID != "failed-task" {
+		t.Fatalf("failed task was not delivered: %+v", delivered)
+	}
+	if !store.RecordOutput("agent-1", &protocol.TaskResult{
+		TaskID: "failed-task",
+		Type:   "screenshot",
+		Error:  "capture failed",
+	}) {
+		t.Fatal("failed task result was not recorded")
+	}
+
+	before := store.Overview()
+	if before.FailedLast24Hours != 1 || len(before.FailureAlerts) != 1 {
+		t.Fatalf("failure alert was not exposed: %+v", before)
+	}
+	body, _ := json.Marshal(map[string]string{"disposition": "acknowledged"})
+	w := doRequest(
+		t,
+		router,
+		http.MethodPut,
+		"/api/overview/alerts/"+before.FailureAlerts[0].ID,
+		body,
+		headers,
+	)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("resolve alert status = %d: %s", w.Code, w.Body.String())
+	}
+
+	after := store.Overview()
+	if after.FailedLast24Hours != 0 || len(after.FailureAlerts) != 0 {
+		t.Fatalf("resolved alert remained actionable: %+v", after.FailureAlerts)
+	}
+	outputs := store.GetOutputs("agent-1")
+	if len(outputs) != 1 || outputs[0].TaskID != "failed-task" || outputs[0].Error == "" {
+		t.Fatalf("resolving Overview alert changed task output: %+v", outputs)
+	}
+	failed := 0
+	for _, bucket := range after.TaskOutcomes24Hours {
+		failed += bucket.Failed
+	}
+	if failed != 1 {
+		t.Fatalf("resolving Overview alert changed chart history: %+v", after.TaskOutcomes24Hours)
+	}
+}
+
+func TestResolveOverviewFailureAlertValidatesRequest(t *testing.T) {
+	router, _ := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	headers := map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	}
+	for _, test := range []struct {
+		name string
+		path string
+		body string
+		want int
+	}{
+		{name: "bad id", path: "/api/overview/alerts/not-an-alert", body: `{"disposition":"acknowledged"}`, want: http.StatusBadRequest},
+		{name: "bad disposition", path: "/api/overview/alerts/0123456789abcdef0123456789abcdef", body: `{"disposition":"cleared"}`, want: http.StatusBadRequest},
+		{name: "missing alert", path: "/api/overview/alerts/0123456789abcdef0123456789abcdef", body: `{"disposition":"acknowledged"}`, want: http.StatusNotFound},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			w := doRequest(t, router, http.MethodPut, test.path, []byte(test.body), headers)
+			if w.Code != test.want {
+				t.Fatalf("status = %d, want %d: %s", w.Code, test.want, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestListAgentsRejectsWrongAudienceToken(t *testing.T) {
+	router, _ := setupAPI(t)
+	token := signToken(t, jwt.RegisteredClaims{
+		Subject:   "operator",
+		Issuer:    "sable-operator",
+		Audience:  jwt.ClaimStrings{"not-the-web-ui"},
+		IssuedAt:  jwt.NewNumericDate(time.Now()),
+		NotBefore: jwt.NewNumericDate(time.Now()),
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+	})
+	w := doRequest(t, router, http.MethodGet, "/api/agents", nil, map[string]string{
+		"Authorization": "Bearer " + token,
+	})
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestQueueTask(t *testing.T) {
+	router, _ := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	body, _ := json.Marshal(map[string]string{"type": "shell", "payload": "whoami"})
+	w := doRequest(t, router, http.MethodPost, "/api/agents/agent-1/task", body, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 queuing task, got %d", w.Code)
+	}
+}
+
+func TestQueueInvalidTaskType(t *testing.T) {
+	router, _ := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	body, _ := json.Marshal(map[string]string{"type": "badtype", "payload": ""})
+	w := doRequest(t, router, http.MethodPost, "/api/agents/agent-1/task", body, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid task type, got %d", w.Code)
+	}
+}
+
+func TestQueueTaskRejectsInvalidSleepValue(t *testing.T) {
+	router, _ := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	body, _ := json.Marshal(map[string]string{"type": "sleep", "payload": "0"})
+	w := doRequest(t, router, http.MethodPost, "/api/agents/agent-1/task", body, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid sleep value, got %d", w.Code)
+	}
+}
+
+func TestQueueTaskRejectsKillPayload(t *testing.T) {
+	router, _ := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	body, _ := json.Marshal(map[string]string{"type": "kill", "payload": "now"})
+	w := doRequest(t, router, http.MethodPost, "/api/agents/agent-1/task", body, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for kill payload, got %d", w.Code)
+	}
+}
+
+func TestQueueTaskAllowsSituationalActions(t *testing.T) {
+	router, store := setupAPI(t)
+	token := loginAndGetToken(t, router)
+
+	for _, taskType := range []string{"ps", "screenshot", "persistence", "peas", "snapshot"} {
+		body, _ := json.Marshal(map[string]string{"type": taskType, "payload": ""})
+		w := doRequest(t, router, http.MethodPost, "/api/agents/agent-1/task", body, map[string]string{
+			"Authorization": "Bearer " + token,
+			"Content-Type":  "application/json",
+		})
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 for %s task, got %d", taskType, w.Code)
+		}
+		task := store.DequeueTask("agent-1")
+		if task == nil || task.Type != taskType || task.Payload != "" {
+			t.Fatalf("expected empty-payload %s task, got %#v", taskType, task)
+		}
+	}
+}
+
+func TestQueueTaskAllowsCancelAndLs(t *testing.T) {
+	router, store := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	for _, req := range []map[string]string{
+		{"type": "cancel", "payload": "task-123"},
+		{"type": "ls", "payload": "/tmp"},
+	} {
+		body, _ := json.Marshal(req)
+		w := doRequest(t, router, http.MethodPost, "/api/agents/agent-1/task", body, map[string]string{
+			"Authorization": "Bearer " + token,
+			"Content-Type":  "application/json",
+		})
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 for %#v, got %d", req, w.Code)
+		}
+		task := store.DequeueTask("agent-1")
+		if task == nil || task.Type != req["type"] || task.Payload != req["payload"] {
+			t.Fatalf("unexpected queued task: %#v", task)
+		}
+	}
+}
+
+func TestDeleteQueuedTask(t *testing.T) {
+	router, store := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	if err := store.EnqueueTask("agent-1", &protocol.Task{ID: "queued-1", Type: "shell", Payload: "id"}); err != nil {
+		t.Fatalf("EnqueueTask: %v", err)
+	}
+	w := doRequest(t, router, http.MethodDelete, "/api/agents/agent-1/tasks/queued-1", nil, map[string]string{
+		"Authorization": "Bearer " + token,
+	})
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 deleting queued task, got %d", w.Code)
+	}
+	if task := store.DequeueTask("agent-1"); task != nil {
+		t.Fatalf("expected queue empty, got %#v", task)
+	}
+}
+
+func TestUpdateAgentMetadata(t *testing.T) {
+	router, store := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	body, _ := json.Marshal(map[string]interface{}{
+		"display_name": "Web Server",
+		"notes":        "reviewed",
+		"tags":         []string{"lab", "windows", "lab"},
+	})
+	w := doRequest(t, router, http.MethodPut, "/api/agents/agent-1/metadata", body, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 updating metadata, got %d", w.Code)
+	}
+	agent, _ := store.Get("agent-1")
+	if agent.DisplayName != "Web Server" || agent.Notes != "reviewed" || len(agent.Tags) != 2 {
+		t.Fatalf("metadata not updated: %#v", agent)
+	}
+}
+
+func TestAgentLifecycleRetiresWithoutDeletingState(t *testing.T) {
+	router, store := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	headers := map[string]string{"Authorization": "Bearer " + token, "Content-Type": "application/json"}
+	w := doRequest(t, router, http.MethodPut, "/api/agents/agent-1/lifecycle", []byte(`{"retired":true}`), headers)
+	if w.Code != http.StatusOK {
+		t.Fatalf("retire status = %d: %s", w.Code, w.Body.String())
+	}
+	agent, ok := store.Get("agent-1")
+	if !ok || !agent.Retired || agent.Status != "retired" {
+		t.Fatalf("agent was not retired: %#v", agent)
+	}
+	if _, ok := store.Secret("agent-1"); !ok {
+		t.Fatal("retirement deleted the agent identity")
+	}
+	queueBody, _ := json.Marshal(map[string]string{"type": "shell", "payload": "id"})
+	w = doRequest(t, router, http.MethodPost, "/api/agents/agent-1/task", queueBody, headers)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 tasking retired agent, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRegisterAgentAcceptsDisplayName(t *testing.T) {
+	router, store := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	body, _ := json.Marshal(map[string]string{
+		"id":           "agent-2",
+		"secret_hex":   strings.Repeat("ab", 32),
+		"display_name": "Build Label",
+	})
+	w := doRequest(t, router, http.MethodPost, "/api/agents", body, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("register status = %d: %s", w.Code, w.Body.String())
+	}
+	agent, ok := store.Get("agent-2")
+	if !ok || agent.DisplayName != "Build Label" {
+		t.Fatalf("display name was not registered: %#v", agent)
+	}
+}
+
+func TestQueueArchiveSelection(t *testing.T) {
+	router, store := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	payload := `{"paths":["/tmp/one","/tmp/two"],"base":"/tmp"}`
+	body, _ := json.Marshal(map[string]string{"type": "download_archive", "payload": payload})
+	w := doRequest(t, router, http.MethodPost, "/api/agents/agent-1/task", body, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("archive queue status = %d: %s", w.Code, w.Body.String())
+	}
+	task := store.DequeueTask("agent-1")
+	if task == nil || task.Type != "download_archive" || task.Payload != payload {
+		t.Fatalf("unexpected archive task: %#v", task)
+	}
+}
+
+func TestAgentArtifactsAPIStoresAndReturnsDataByID(t *testing.T) {
+	router, _ := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	body, _ := json.Marshal(map[string]interface{}{
+		"key":      "task-1:report.txt",
+		"task_id":  "task-1",
+		"label":    "report",
+		"filename": "report.txt",
+		"mime":     "text/plain",
+		"data":     "aGVsbG8=",
+	})
+
+	w := doRequest(t, router, http.MethodPost, "/api/agents/agent-1/artifacts", body, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 creating artifact, got %d: %s", w.Code, w.Body.String())
+	}
+	var created session.Artifact
+	json.NewDecoder(w.Body).Decode(&created) //nolint:errcheck
+	if created.ID == "" || created.Data != "" {
+		t.Fatalf("expected artifact summary with id and no data, got %#v", created)
+	}
+
+	w = doRequest(t, router, http.MethodGet, "/api/agents/agent-1/artifacts", nil, map[string]string{
+		"Authorization": "Bearer " + token,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 listing artifacts, got %d", w.Code)
+	}
+	var listed []session.Artifact
+	json.NewDecoder(w.Body).Decode(&listed) //nolint:errcheck
+	if len(listed) != 1 || listed[0].Data != "" {
+		t.Fatalf("expected one listed summary without data, got %#v", listed)
+	}
+
+	w = doRequest(t, router, http.MethodGet, "/api/agents/agent-1/artifacts/"+created.ID, nil, map[string]string{
+		"Authorization": "Bearer " + token,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 getting artifact, got %d", w.Code)
+	}
+	var full session.Artifact
+	json.NewDecoder(w.Body).Decode(&full) //nolint:errcheck
+	if full.Data != "aGVsbG8=" || full.Filename != "report.txt" {
+		t.Fatalf("expected full artifact data, got %#v", full)
+	}
+}
+
+func TestAgentArtifactsAPIRejectsInvalidBase64(t *testing.T) {
+	router, _ := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	body, _ := json.Marshal(map[string]string{
+		"filename": "bad.bin",
+		"data":     "not-base64",
+	})
+	w := doRequest(t, router, http.MethodPost, "/api/agents/agent-1/artifacts", body, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid artifact data, got %d", w.Code)
+	}
+}
+
+func TestQueueTaskRejectsSituationalPayload(t *testing.T) {
+	router, _ := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	body, _ := json.Marshal(map[string]string{"type": "peas", "payload": "all"})
+	w := doRequest(t, router, http.MethodPost, "/api/agents/agent-1/task", body, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for peas payload, got %d", w.Code)
+	}
+}
+
+func TestQueueTaskRejectsInvalidUploadPayload(t *testing.T) {
+	router, _ := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	body, _ := json.Marshal(map[string]string{"type": "upload", "payload": "/tmp/file:not-base64"})
+	w := doRequest(t, router, http.MethodPost, "/api/agents/agent-1/task", body, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid upload payload, got %d", w.Code)
+	}
+}
+
+func TestQueueTaskRejectsLargeUploadForDNSTransport(t *testing.T) {
+	router, store := setupAPI(t)
+	store.UpdateInfoWithTransport("agent-1", "victim", "linux", "amd64", "dns")
+	token := loginAndGetToken(t, router)
+
+	body, _ := json.Marshal(map[string]string{
+		"type":    "upload",
+		"payload": "/tmp/file:" + strings.Repeat("A", 12*1024),
+	})
+	w := doRequest(t, router, http.MethodPost, "/api/agents/agent-1/task", body, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for large DNS upload, got %d", w.Code)
+	}
+}
+
+func TestQueueTaskNormalizesInteractivePayload(t *testing.T) {
+	router, store := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	body, _ := json.Marshal(map[string]string{"type": "interactive", "payload": " start "})
+	w := doRequest(t, router, http.MethodPost, "/api/agents/agent-1/task", body, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for normalized interactive payload, got %d", w.Code)
+	}
+	task := store.DequeueTask("agent-1")
+	if task == nil || task.Payload != "start" {
+		t.Fatalf("expected normalized payload %q, got %#v", "start", task)
+	}
+}
+
+func TestQueueTaskAllowsPathCompletion(t *testing.T) {
+	router, store := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	body, _ := json.Marshal(map[string]string{"type": "complete", "payload": " /home/sa "})
+	w := doRequest(t, router, http.MethodPost, "/api/agents/agent-1/task", body, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for completion task, got %d", w.Code)
+	}
+	task := store.DequeueTask("agent-1")
+	if task == nil || task.Type != "complete" || task.Payload != "/home/sa" {
+		t.Fatalf("expected normalized completion task, got %#v", task)
+	}
+}
+
+func TestQueueTaskAllowsPathBrowseControl(t *testing.T) {
+	router, store := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	body, _ := json.Marshal(map[string]string{"type": "pathbrowse", "payload": " start "})
+	w := doRequest(t, router, http.MethodPost, "/api/agents/agent-1/task", body, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for pathbrowse task, got %d", w.Code)
+	}
+	task := store.DequeueTask("agent-1")
+	if task == nil || task.Type != "pathbrowse" || task.Payload != "start" {
+		t.Fatalf("expected normalized pathbrowse task, got %#v", task)
+	}
+}
+
+func TestQueueTaskNormalizesSleepPayload(t *testing.T) {
+	router, store := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	body, _ := json.Marshal(map[string]string{"type": "sleep", "payload": " 60 "})
+	w := doRequest(t, router, http.MethodPost, "/api/agents/agent-1/task", body, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for normalized sleep payload, got %d", w.Code)
+	}
+	task := store.DequeueTask("agent-1")
+	if task == nil || task.Payload != "60" {
+		t.Fatalf("expected normalized payload %q, got %#v", "60", task)
+	}
+}
+
+func TestRegisterAgent(t *testing.T) {
+	router, store := setupAPI(t)
+	token := loginAndGetToken(t, router)
+
+	// Valid registration.
+	body, _ := json.Marshal(map[string]string{
+		"id":         "new-agent-123",
+		"secret_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+	})
+	w := doRequest(t, router, http.MethodPost, "/api/agents", body, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 on agent registration, got %d", w.Code)
+	}
+	if _, ok := store.Get("new-agent-123"); !ok {
+		t.Fatal("agent not found in store after registration")
+	}
+}
+
+func TestRegisterAgentInvalidSecret(t *testing.T) {
+	router, _ := setupAPI(t)
+	token := loginAndGetToken(t, router)
+
+	body, _ := json.Marshal(map[string]string{"id": "x", "secret_hex": "tooshort"})
+	w := doRequest(t, router, http.MethodPost, "/api/agents", body, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for short secret, got %d", w.Code)
+	}
+}
+
+func TestGetTaskOutputs(t *testing.T) {
+	router, _ := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	w := doRequest(t, router, http.MethodGet, "/api/agents/agent-1/tasks", nil, map[string]string{
+		"Authorization": "Bearer " + token,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for task outputs, got %d", w.Code)
+	}
+}
+
+func TestClearTaskOutputs(t *testing.T) {
+	router, store := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	if err := store.EnqueueTask("agent-1", &protocol.Task{ID: "task-1", Type: "shell"}); err != nil {
+		t.Fatal(err)
+	}
+	if task := store.DeliverTask("agent-1"); task == nil {
+		t.Fatal("expected task delivery")
+	}
+	store.RecordOutput("agent-1", &protocol.TaskResult{TaskID: "task-1", Type: "shell", Output: "hello"})
+
+	w := doRequest(t, router, http.MethodDelete, "/api/agents/agent-1/tasks", nil, map[string]string{
+		"Authorization": "Bearer " + token,
+	})
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for clear outputs, got %d", w.Code)
+	}
+	if outputs := store.GetOutputs("agent-1"); len(outputs) != 0 {
+		t.Fatalf("expected cleared outputs, got %+v", outputs)
+	}
+}
+
+func TestSecurityHeaders(t *testing.T) {
+	router, _ := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	w := doRequest(t, router, http.MethodGet, "/api/agents", nil, map[string]string{
+		"Authorization": "Bearer " + token,
+	})
+	if w.Header().Get("X-Frame-Options") != "DENY" {
+		t.Error("missing X-Frame-Options: DENY")
+	}
+	if w.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Error("missing X-Content-Type-Options: nosniff")
+	}
+	if w.Header().Get("Content-Security-Policy") == "" {
+		t.Error("missing Content-Security-Policy header")
+	}
+	if w.Header().Get("Cross-Origin-Opener-Policy") != "same-origin" {
+		t.Error("missing Cross-Origin-Opener-Policy: same-origin")
+	}
+	if w.Header().Get("Cross-Origin-Resource-Policy") != "same-origin" {
+		t.Error("missing Cross-Origin-Resource-Policy: same-origin")
+	}
+	if w.Header().Get("X-Permitted-Cross-Domain-Policies") != "none" {
+		t.Error("missing X-Permitted-Cross-Domain-Policies: none")
+	}
+	if w.Header().Get("Cache-Control") != "no-store" {
+		t.Error("missing Cache-Control: no-store")
+	}
+}
+
+func TestLoginRejectsOversizedBody(t *testing.T) {
+	router, _ := setupAPI(t)
+	body := []byte(`{"password":"` + strings.Repeat("a", 5000) + `"}`)
+	w := doRequest(t, router, http.MethodPost, "/api/auth/login", body, map[string]string{
+		"Content-Type": "application/json",
+	})
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 for oversized login body, got %d", w.Code)
+	}
+}
+
+func TestLoginRateLimitSetsRetryAfter(t *testing.T) {
+	router, _ := setupAPI(t)
+	body, _ := json.Marshal(map[string]string{"password": "wrongpassword"})
+	var last *httptest.ResponseRecorder
+	for i := 0; i < 6; i++ {
+		last = doRequest(t, router, http.MethodPost, "/api/auth/login", body, map[string]string{
+			"Content-Type": "application/json",
+		})
+	}
+	if last.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 after repeated failures, got %d", last.Code)
+	}
+	if last.Header().Get("Retry-After") == "" {
+		t.Fatal("expected Retry-After header on login rate limit")
+	}
+}
+
+func TestQueueTaskPayloadTooLarge(t *testing.T) {
+	router, _ := setupAPI(t)
+	token := loginAndGetToken(t, router)
+	body, _ := json.Marshal(map[string]string{
+		"type":    "shell",
+		"payload": strings.Repeat("A", 49*1024),
+	})
+	w := doRequest(t, router, http.MethodPost, "/api/agents/agent-1/task", body, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	})
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 for oversized task payload, got %d", w.Code)
+	}
+}
+
+func TestQueueTaskReturns429WhenQueueFull(t *testing.T) {
+	router, _ := setupAPI(t)
+	token := loginAndGetToken(t, router)
+
+	for i := 0; i < 64; i++ {
+		body, _ := json.Marshal(map[string]string{"type": "shell", "payload": "id"})
+		w := doRequest(t, router, http.MethodPost, "/api/agents/agent-1/task", body, map[string]string{
+			"Authorization": "Bearer " + token,
+			"Content-Type":  "application/json",
+		})
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 while filling queue, got %d at %d", w.Code, i)
+		}
+	}
+
+	body, _ := json.Marshal(map[string]string{"type": "shell", "payload": "id"})
+	w := doRequest(t, router, http.MethodPost, "/api/agents/agent-1/task", body, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	})
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 when queue is full, got %d", w.Code)
+	}
+}

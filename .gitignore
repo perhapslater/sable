@@ -1,0 +1,69 @@
+# Generated secrets and credentials. Never commit these.
+config.env
+agents/
+server.crt
+server.key
+pw.txt
+sable-state.json
+sable-state.json.tmp-*
+sable-state.json.recovery-*
+/sable-state.json.artifacts/
+/sable-state.json.recovery-*.artifacts/
+.sable/
+
+# Compiled binaries (root-level build outputs)
+/sable-server
+/sable-server.exe
+/teamserver
+/teamserver.exe
+/agent
+/agent.exe
+/agent-*
+/gensecret
+/gensecret.exe
+/sablectl
+/sablectl.exe
+/livecheckcodex
+/livecheckcodex.exe
+
+# Per-agent build artifacts (live under builds/<label>/)
+/builds/
+
+# Locally cached third-party PEAS scripts embedded into offline-capable agents.
+/internal/agent/peas/linpeas.sh
+/internal/agent/peas/winPEAS.bat
+
+# Go test & coverage output
+*.test
+*.out
+coverage.*
+
+# Local Go caches used for sandbox-safe test runs
+.gocache/
+.gomodcache/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# AI assistant artifacts
+AGENTS.md
+.claude/
+.cursor/
+.aider*
+.continue/
+.codeium/
+.windsurfrules
+.specstory/
+.github/copilot/
+CLAUDE.md
+AGENTS.md
+
+# Local QA server build (preserved locally, excluded from publication)
+/.qa-sable-server.exe

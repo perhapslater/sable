@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "release/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Verify module files
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Check formatting
+        run: |
+          files="$(gofmt -l .)"
+          if [ -n "$files" ]; then
+            echo "$files"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Static analysis
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          staticcheck ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Race detector
+        run: go test -race ./...
+
+      - name: JavaScript syntax and unit tests
+        run: |
+          for file in web/*.js; do node --check "$file"; done
+          node --test web/logic.test.cjs
+
+      - name: Vulnerability scan
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          govulncheck ./...
+
+      - name: Secret scan
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          go install github.com/zricethezav/gitleaks/v8@v8.30.1
+          gitleaks dir --redact --no-banner .
+
+          zero=0000000000000000000000000000000000000000
+          # A clean-root migration can make the previous tip unavailable or
+          # unrelated. In that case scan all history reachable from this tip.
+          range="$GITHUB_SHA"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            range="$BASE_SHA..$HEAD_SHA"
+          elif [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "$zero" ] \
+            && git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null \
+            && git merge-base --is-ancestor "$BEFORE_SHA" "$GITHUB_SHA"; then
+            range="$BEFORE_SHA..$GITHUB_SHA"
+          fi
+          gitleaks git --redact --no-banner --log-opts="$range" .
+
+      - name: Validate OpenAPI
+        run: npx --yes @redocly/cli@2.39.0 lint docs/openapi.yaml
+
+      - name: Integration tests
+        run: go test -tags integration -v ./...
+
+      - name: Build all commands
+        run: go build ./...
+
+      - name: Cross-build Windows commands
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: go build ./...
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test Windows implementation
+        run: go test ./...
+
+      - name: Build Windows commands
+        run: go build ./...
+
+      - name: JavaScript syntax and unit tests
+        run: |
+          node --check web/app.js
+          node --test web/logic.test.cjs

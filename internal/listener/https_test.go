@@ -1,0 +1,381 @@
+package listener_test
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/perhapslater/sable/internal/listener"
+	"github.com/perhapslater/sable/internal/nonce"
+	"github.com/perhapslater/sable/internal/protocol"
+	"github.com/perhapslater/sable/internal/session"
+)
+
+var testSecret = []byte("32-byte-test-secret-padding-here")
+
+func newTestSetup(t *testing.T) (*listener.HTTPSHandler, *session.Store) {
+	t.Helper()
+	store := session.NewStore()
+	store.Register(&session.Agent{
+		ID:       "agent-1",
+		Secret:   testSecret,
+		Hostname: "victim",
+		OS:       "linux",
+		Arch:     "amd64",
+	})
+	nc := nonce.NewCache(5 * time.Minute)
+	return listener.NewHTTPSHandler(store, nc), store
+}
+
+func makeBeacon(t *testing.T, agentID string, secret []byte, timestamp int64) []byte {
+	t.Helper()
+	n, err := protocol.RandomNonce()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := &protocol.Beacon{
+		AgentID:   agentID,
+		Timestamp: timestamp,
+		Nonce:     n,
+		Hostname:  "victim",
+		OS:        "linux",
+		Arch:      "amd64",
+		HostIP:    "10.10.20.25",
+	}
+	encoded, err := protocol.EncodeBeacon(b, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
+func postBeacon(t *testing.T, handler http.Handler, body []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/cdn/static/update", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	return w
+}
+
+func TestValidBeaconReturns200(t *testing.T) {
+	h, store := newTestSetup(t)
+	body := makeBeacon(t, "agent-1", testSecret, time.Now().Unix())
+	w := postBeacon(t, h, body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	agent, ok := store.Get("agent-1")
+	if !ok || agent.HostIP != "10.10.20.25" {
+		t.Fatalf("agent host IP was not recorded: %+v", agent)
+	}
+}
+
+func TestInvalidHMACReturns404(t *testing.T) {
+	h, _ := newTestSetup(t)
+	body := makeBeacon(t, "agent-1", testSecret, time.Now().Unix())
+	body[len(body)-2] ^= 0xff // tamper
+	w := postBeacon(t, h, body)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 on tampered beacon, got %d", w.Code)
+	}
+}
+
+func TestReplayAttackReturns404(t *testing.T) {
+	h, _ := newTestSetup(t)
+	body := makeBeacon(t, "agent-1", testSecret, time.Now().Unix())
+	w1 := postBeacon(t, h, body)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("first request should be 200, got %d", w1.Code)
+	}
+	w2 := postBeacon(t, h, body)
+	if w2.Code != http.StatusNotFound {
+		t.Fatalf("replay should be 404, got %d", w2.Code)
+	}
+}
+
+func TestUnknownAgentIDReturns404(t *testing.T) {
+	h, _ := newTestSetup(t)
+	body := makeBeacon(t, "unknown-agent", testSecret, time.Now().Unix())
+	w := postBeacon(t, h, body)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("unknown agent must get 404, got %d", w.Code)
+	}
+}
+
+func TestExpiredTimestampReturns404(t *testing.T) {
+	h, _ := newTestSetup(t)
+	oldTs := time.Now().Add(-10 * time.Minute).Unix()
+	body := makeBeacon(t, "agent-1", testSecret, oldTs)
+	w := postBeacon(t, h, body)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expired timestamp must get 404, got %d", w.Code)
+	}
+}
+
+func TestInvalidBeaconMetadataIsRejectedBeforeSessionMutation(t *testing.T) {
+	h, store := newTestSetup(t)
+	tests := []struct {
+		name   string
+		beacon *protocol.Beacon
+	}{
+		{
+			name: "nonce length",
+			beacon: &protocol.Beacon{
+				AgentID: "agent-1", Timestamp: time.Now().Unix(), Nonce: []byte("short"), Hostname: "victim", OS: "linux", Arch: "amd64",
+			},
+		},
+		{
+			name: "hostname length",
+			beacon: &protocol.Beacon{
+				AgentID: "agent-1", Timestamp: time.Now().Unix(), Nonce: []byte("0123456789abcdef"), Hostname: strings.Repeat("h", 256), OS: "linux", Arch: "amd64",
+			},
+		},
+		{
+			name: "invalid host IP",
+			beacon: &protocol.Beacon{
+				AgentID: "agent-1", Timestamp: time.Now().Unix(), Nonce: []byte("0123456789abcdef"), Hostname: "victim", OS: "linux", Arch: "amd64", HostIP: "callback.example",
+			},
+		},
+		{
+			name: "extreme timestamp",
+			beacon: &protocol.Beacon{
+				AgentID: "agent-1", Timestamp: int64(^uint64(0) >> 1), Nonce: []byte("fedcba9876543210"), Hostname: "victim", OS: "linux", Arch: "amd64",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, err := protocol.EncodeBeacon(tt.beacon, testSecret)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response := postBeacon(t, h, body); response.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404", response.Code)
+			}
+		})
+	}
+	agent, _ := store.Get("agent-1")
+	if !agent.LastSeen.IsZero() {
+		t.Fatalf("invalid metadata mutated session last-seen: %s", agent.LastSeen)
+	}
+}
+
+func TestWrongMethodReturns404(t *testing.T) {
+	h, _ := newTestSetup(t)
+	req := httptest.NewRequest(http.MethodGet, "/cdn/static/update", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("GET must return 404, got %d", w.Code)
+	}
+}
+
+func TestCrossAgentImpersonationReturns404(t *testing.T) {
+	// Register a victim agent with a different secret.
+	h, store := newTestSetup(t)
+	victimSecret := []byte("victim-secret-32-bytes-padding-x")
+	store.Register(&session.Agent{
+		ID:     "victim",
+		Secret: victimSecret,
+	})
+	if err := store.EnqueueTask("victim", &protocol.Task{ID: "stolen-task", Type: "shell", Payload: "id"}); err != nil {
+		t.Fatalf("EnqueueTask victim: %v", err)
+	}
+
+	// Rogue agent: valid beacon for "agent-1" (envelope and payload agree),
+	// but the internal AgentID is "victim". The MAC now covers "agent-1"||ct,
+	// so the only way to pass is to have envelope.id == decrypted.agent_id.
+	// This creates a beacon for "agent-1" with agent-1's secret, but sends it
+	// with a raw-JSON-modified envelope to simulate the attack.
+	n, _ := protocol.RandomNonce()
+	b := &protocol.Beacon{
+		AgentID: "agent-1", Timestamp: time.Now().Unix(), Nonce: n,
+		Hostname: "rogue", OS: "linux", Arch: "amd64",
+	}
+	encoded, _ := protocol.EncodeBeacon(b, testSecret)
+	// Tamper: change the envelope "id" to "victim" to try to steal victim's task.
+	var raw map[string]interface{}
+	json.Unmarshal(encoded, &raw) //nolint:errcheck
+	raw["id"] = "victim"
+	tampered, _ := json.Marshal(raw)
+
+	w := postBeacon(t, h, tampered)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("cross-agent impersonation must return 404, got %d", w.Code)
+	}
+	// Victim's task must remain in the queue untouched.
+	remaining := store.DequeueTask("victim")
+	if remaining == nil || remaining.ID != "stolen-task" {
+		t.Fatal("victim's task was stolen or missing")
+	}
+}
+
+func TestTaskDeliveredOnBeacon(t *testing.T) {
+	h, store := newTestSetup(t)
+	if err := store.EnqueueTask("agent-1", &protocol.Task{ID: "t1", Type: "shell", Payload: "whoami"}); err != nil {
+		t.Fatalf("EnqueueTask agent-1: %v", err)
+	}
+
+	body := makeBeacon(t, "agent-1", testSecret, time.Now().Unix())
+	w := postBeacon(t, h, body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	task, err := protocol.DecodeTask(w.Body.Bytes(), testSecret)
+	if err != nil {
+		t.Fatalf("DecodeTask failed: %v", err)
+	}
+	if task.ID != "t1" || task.Type != "shell" {
+		t.Fatalf("unexpected task: %+v", task)
+	}
+}
+
+func TestTaskIsRedeliveredAfterResponseLossUntilAcknowledged(t *testing.T) {
+	h, store := newTestSetup(t)
+	if err := store.EnqueueTask("agent-1", &protocol.Task{ID: "t1", Type: "shell", Payload: "whoami"}); err != nil {
+		t.Fatal(err)
+	}
+
+	first := postBeacon(t, h, makeBeacon(t, "agent-1", testSecret, time.Now().Unix()))
+	second := postBeacon(t, h, makeBeacon(t, "agent-1", testSecret, time.Now().Unix()))
+	for i, response := range []*httptest.ResponseRecorder{first, second} {
+		task, err := protocol.DecodeTask(response.Body.Bytes(), testSecret)
+		if err != nil || task.ID != "t1" {
+			t.Fatalf("response %d did not redeliver task: task=%+v err=%v", i+1, task, err)
+		}
+	}
+
+	ack := makeBeaconWithOutput(t, "agent-1", testSecret, &protocol.TaskResult{TaskID: "t1", Type: "shell", Output: "user"})
+	response := postBeacon(t, h, ack)
+	task, err := protocol.DecodeTask(response.Body.Bytes(), testSecret)
+	if err != nil || task.Type != "noop" {
+		t.Fatalf("acknowledged task should leave a noop response: task=%+v err=%v", task, err)
+	}
+	if queued := store.GetQueuedTasks("agent-1"); len(queued) != 0 {
+		t.Fatalf("acknowledged task remained queued: %+v", queued)
+	}
+}
+
+func TestMaliciousResultChunkTotalReturnsBoundedError(t *testing.T) {
+	h, store := newTestSetup(t)
+	if err := store.EnqueueTask("agent-1", &protocol.Task{ID: "bad-chunks", Type: "download"}); err != nil {
+		t.Fatal(err)
+	}
+	store.DeliverTask("agent-1")
+	body := makeBeaconWithOutput(t, "agent-1", testSecret, &protocol.TaskResult{
+		TaskID: "bad-chunks", Type: "download", Output: "x", ChunkIndex: 0, ChunkTotal: 1_000_000_000,
+	})
+	response := postBeacon(t, h, body)
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected terminal response, got %d", response.Code)
+	}
+	outputs := store.GetOutputs("agent-1")
+	if len(outputs) != 1 || !strings.Contains(outputs[0].Error, "chunk count") {
+		t.Fatalf("unexpected validation result: %+v", outputs)
+	}
+}
+
+func TestLargeChunkedOutputAccepted(t *testing.T) {
+	h, store := newTestSetup(t)
+	if err := store.EnqueueTask("agent-1", &protocol.Task{ID: "large-chunk", Type: "download"}); err != nil {
+		t.Fatal(err)
+	}
+	store.DeliverTask("agent-1")
+	body := makeBeaconWithOutput(t, "agent-1", testSecret, &protocol.TaskResult{
+		TaskID:     "large-chunk",
+		Type:       "download",
+		Output:     strings.Repeat("x", 512*1024),
+		ChunkIndex: 0,
+		ChunkTotal: 2,
+	})
+	w := postBeacon(t, h, body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for large chunk, got %d", w.Code)
+	}
+	if outs := store.GetOutputs("agent-1"); len(outs) != 0 {
+		t.Fatalf("expected incomplete large chunk to remain hidden, got %+v", outs)
+	}
+}
+
+func TestChunkedOutputDefersTaskDeliveryUntilComplete(t *testing.T) {
+	h, store := newTestSetup(t)
+	if err := store.EnqueueTask("agent-1", &protocol.Task{ID: "chunked-result", Type: "download"}); err != nil {
+		t.Fatalf("EnqueueTask agent-1: %v", err)
+	}
+	if err := store.EnqueueTask("agent-1", &protocol.Task{ID: "next-task", Type: "shell", Payload: "id"}); err != nil {
+		t.Fatalf("EnqueueTask agent-1: %v", err)
+	}
+	store.DeliverTask("agent-1")
+
+	first := makeBeaconWithOutput(t, "agent-1", testSecret, &protocol.TaskResult{
+		TaskID:     "chunked-result",
+		Type:       "download",
+		Output:     "hello ",
+		ChunkIndex: 0,
+		ChunkTotal: 2,
+	})
+	w := postBeacon(t, h, first)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for first chunk, got %d", w.Code)
+	}
+	task, err := protocol.DecodeTask(w.Body.Bytes(), testSecret)
+	if err != nil {
+		t.Fatalf("DecodeTask first chunk: %v", err)
+	}
+	if task.Type != "noop" {
+		t.Fatalf("expected noop while chunked output is incomplete, got %+v", task)
+	}
+	if outs := store.GetOutputs("agent-1"); len(outs) != 0 {
+		t.Fatalf("expected no visible output before reassembly, got %+v", outs)
+	}
+
+	second := makeBeaconWithOutput(t, "agent-1", testSecret, &protocol.TaskResult{
+		TaskID:     "chunked-result",
+		Type:       "download",
+		Output:     "world",
+		ChunkIndex: 1,
+		ChunkTotal: 2,
+	})
+	w = postBeacon(t, h, second)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for second chunk, got %d", w.Code)
+	}
+	task, err = protocol.DecodeTask(w.Body.Bytes(), testSecret)
+	if err != nil {
+		t.Fatalf("DecodeTask second chunk: %v", err)
+	}
+	if task.ID != "next-task" {
+		t.Fatalf("expected queued task after final chunk, got %+v", task)
+	}
+	outs := store.GetOutputs("agent-1")
+	if len(outs) != 1 || outs[0].Output != "hello world" {
+		t.Fatalf("expected reassembled output, got %+v", outs)
+	}
+}
+
+func makeBeaconWithOutput(t *testing.T, agentID string, secret []byte, output *protocol.TaskResult) []byte {
+	t.Helper()
+	n, err := protocol.RandomNonce()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := &protocol.Beacon{
+		AgentID:    agentID,
+		Timestamp:  time.Now().Unix(),
+		Nonce:      n,
+		Hostname:   "victim",
+		OS:         "linux",
+		Arch:       "amd64",
+		TaskOutput: output,
+	}
+	encoded, err := protocol.EncodeBeacon(b, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
